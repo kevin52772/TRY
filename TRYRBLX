@@ -1,400 +1,879 @@
---[[
-    GROW-A-GARDEN STYLE - AUTO TRADE (SAFE FOR YOUR OWN GAME)
-    Client + Server unified script (split at runtime).
-    Use ONLY in a game you own/control. Do NOT attempt to use in other developers' games.
-    Features:
-      - ReplicatedStorage.GameEvents setup (Trade_RE, Notification)
-      - Client UI (dark theme) with dropdown target, select pets, trade all / selected
-      - Server handler that validates and moves Tool instances from sender -> receiver
-      - Notifications to both sender & receiver
---]]
-
------------------------
--- SHARED (CREATES EVENTS IF MISSING)
------------------------
+-- Fixed / defensive version of your Auto Trade (minimal changes)
+-- Services
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
 
-local GameEvents = ReplicatedStorage:FindFirstChild("GameEvents")
-if not GameEvents then
-    GameEvents = Instance.new("Folder")
-    GameEvents.Name = "GameEvents"
-    GameEvents.Parent = ReplicatedStorage
-end
+-- Wait for LocalPlayer & Character to exist (defensive)
+repeat task.wait() until Players.LocalPlayer
+LocalPlayer = Players.LocalPlayer
+repeat task.wait() until LocalPlayer.Character
 
-local Trade_RE = GameEvents:FindFirstChild("Trade_RE")
-if not Trade_RE then
-    Trade_RE = Instance.new("RemoteEvent")
-    Trade_RE.Name = "Trade_RE"
-    Trade_RE.Parent = GameEvents
-end
+-- State
+local tradeAccepted = false
+local petStatus = {}
+local favoriteBlocked = false
+local notHoldingTool = false
 
-local Notification = GameEvents:FindFirstChild("Notification")
-if not Notification then
-    Notification = Instance.new("RemoteEvent")
-    Notification.Name = "Notification"
-    Notification.Parent = GameEvents
-end
-
------------------------
--- SERVER SIDE: Trade handler (runs only on server)
------------------------
-if RunService:IsServer() then
-    -- Utility: find player by name or by Player object
-    local function resolvePlayer(value)
-        if typeof(value) == "Instance" and value:IsA("Player") then
-            return value
-        elseif typeof(value) == "string" then
-            return Players:FindFirstChild(value)
-        end
-        return nil
-    end
-
-    Trade_RE.OnServerEvent:Connect(function(sender, data)
-        -- Expect data to be table: { Action = "GivePet", Target = <Player or name>, PetName = "ToolName" }
-        if typeof(data) ~= "table" then
-            -- Optionally notify sender
-            Notification:FireClient(sender, "Invalid trade payload.")
-            return
-        end
-
-        if data.Action ~= "GivePet" and data.Action ~= "GiftPet" then
-            Notification:FireClient(sender, "Unsupported action.")
-            return
-        end
-
-        local target = resolvePlayer(data.Target)
-        local petName = data.PetName
-
-        if not (sender and target and target:IsA("Player")) then
-            Notification:FireClient(sender, "Target not found.")
-            return
-        end
-        if sender == target then
-            Notification:FireClient(sender, "Cannot trade to yourself.")
-            return
-        end
-
-        local senderBackpack = sender:FindFirstChildOfClass("Backpack")
-        local targetBackpack = target:FindFirstChildOfClass("Backpack")
-        if not (senderBackpack and targetBackpack) then
-            Notification:FireClient(sender, "Backpack missing (sender/target).")
-            return
-        end
-
-        -- Find the pet/tool either in Backpack or Character (equipped)
-        local petTool = senderBackpack:FindFirstChild(petName) or (sender.Character and sender.Character:FindFirstChild(petName))
-        if not petTool or not petTool:IsA("Tool") then
-            Notification:FireClient(sender, "Pet not found: ".. tostring(petName))
-            return
-        end
-
-        -- Security: optional validation hook (you can extend)
-        -- e.g., check if tool has a specific tag or child (like "Pet Local Script") to ensure it's a pet
-        if not petTool:FindFirstChild("Pet Local Script") and not petTool:FindFirstChildWhichIsA then
-            -- Not strictly rejecting — you can customize validation. For now we allow transfer.
-        end
-
-        -- Transfer: move the actual Instance from sender -> target backpack
-        -- Note: this performs a direct move. You could optionally Clone() instead if you want different behavior.
-        local success, err = pcall(function()
-            petTool.Parent = targetBackpack
-        end)
-        if not success then
-            Notification:FireClient(sender, "Failed to transfer: ".. (err or "unknown"))
-            return
-        end
-
-        -- Notify both players
-        Notification:FireClient(sender, "Traded '" .. petName .. "' to " .. target.Name)
-        Notification:FireClient(target, "You received '" .. petName .. "' from " .. sender.Name)
-    end)
-
-    -- Optional: helper for server console
-    print("[AutoTrade] Server handler active - ready to accept structured trade requests.")
+-- Config (defensive)
+local config = (getgenv and getgenv().Configuration) or nil
+if not config then
+    -- don't hard error here so script can still load UI and show message
+    warn("Configuration not found! Please set getgenv().Configuration before running. Script will stop.")
     return
 end
 
------------------------
--- CLIENT SIDE: UI + logic (runs only on client)
------------------------
-if RunService:IsClient() then
-    local LocalPlayer = Players.LocalPlayer
-    local UserInputService = game:GetService("UserInputService")
+local petToGive = config.petToGive
+local tradeWholeInventory = config.tradeWholeInventory or false
 
-    -- Config (global so user can tweak target name from console)
-    getgenv().AutoTradeConfig = getgenv().AutoTradeConfig or {
-        targetUsername = "",
-        tradeWholeInventory = false,
-        selectedPets = {}
+if not tradeWholeInventory then
+    if not petToGive or #petToGive == 0 then
+        warn("No pets configured for trading! Please set Configuration.petToGive or enable tradeWholeInventory.")
+        return
+    end
+end
+
+local targetUsername = config.targetUsername
+if not targetUsername then
+    warn("No target username configured! Please set Configuration.targetUsername.")
+    return
+end
+
+local whiteScreen = config.whiteScreen or false
+local leaveWhenDone = config.leaveWhenDone ~= false -- default true
+
+-- Check if current player is the receiver
+local isReceiver = (LocalPlayer.Name == targetUsername)
+if isReceiver then
+    print("Auto-Receiver mode activated for player: " .. LocalPlayer.Name)
+end
+
+-- =========================================================
+-- UI (Improved + Bigger) with defensive CoreGui changes
+-- =========================================================
+-- Cleanup (pcall wrapped)
+pcall(function()
+    for _, gui in pairs(game:GetService("CoreGui"):GetChildren()) do
+        if gui.Name == "Auto Trade UI" or gui.Name == "Auto Trade White Screen" then
+            gui:Destroy()
+        end
+    end
+end)
+
+-- White Screen UI variables
+local whiteScreenEnabled = whiteScreen
+local whiteScreenGui, whiteScreenText, normalUI
+
+local function createWhiteScreen()
+    whiteScreenGui = Instance.new("ScreenGui")
+    whiteScreenGui.Name = "Auto Trade White Screen"
+    whiteScreenGui.IgnoreGuiInset = true
+    whiteScreenGui.ResetOnSpawn = false
+    whiteScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    -- safe parent
+    pcall(function() whiteScreenGui.Parent = game.CoreGui end)
+
+    local whiteFrame = Instance.new("Frame")
+    whiteFrame.Size = UDim2.new(1, 0, 1, 0)
+    whiteFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    whiteFrame.BorderSizePixel = 0
+    whiteFrame.Parent = whiteScreenGui
+
+    whiteScreenText = Instance.new("TextLabel")
+    whiteScreenText.Size = UDim2.new(0, 400, 0, 100)
+    whiteScreenText.Position = UDim2.new(0.5, -200, 0.5, -50)
+    whiteScreenText.BackgroundTransparency = 1
+    whiteScreenText.Text = "Auto Trade - Loading..."
+    whiteScreenText.TextColor3 = Color3.fromRGB(50, 50, 50)
+    whiteScreenText.TextXAlignment = Enum.TextXAlignment.Center
+    whiteScreenText.TextYAlignment = Enum.TextYAlignment.Center
+    whiteScreenText.Font = Enum.Font.GothamSemibold
+    whiteScreenText.TextSize = 24
+    whiteScreenText.TextWrapped = true
+    whiteScreenText.Parent = whiteScreenGui
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.fromOffset(60, 30)
+    toggleBtn.Position = UDim2.new(0.5, 320 - 60, 0.5, -230 - 40)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(200, 200, 200)
+    toggleBtn.Text = "UI"
+    toggleBtn.TextColor3 = Color3.fromRGB(50, 50, 50)
+    toggleBtn.Font = Enum.Font.Gotham
+    toggleBtn.TextSize = 16
+    toggleBtn.Parent = whiteScreenGui
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        whiteScreenEnabled = not whiteScreenEnabled
+        updateUIVisibility()
+    end)
+end
+
+-- Root GUI (safe parent)
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Auto Trade UI"
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() ScreenGui.Parent = game.CoreGui end)
+
+-- Main Frame
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.fromOffset(640, 460)
+MainFrame.Position = UDim2.new(0.5, -320, 0.5, -230)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner", MainFrame)
+MainCorner.CornerRadius = UDim.new(0, 16)
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Thickness = 2
+MainStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+MainStroke.Color = Color3.fromRGB(70, 70, 70)
+
+-- Top Bar
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 56)
+TopBar.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 16)
+
+local Title = Instance.new("TextLabel")
+Title.Name = "Title"
+Title.Size = UDim2.new(1, -24, 1, 0)
+Title.Position = UDim2.new(0, 12, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = isReceiver and "Ducky Hub • GAG Auto Trade (RECEIVER MODE)" or "Ducky Hub • GAG Auto Trade"
+Title.TextColor3 = isReceiver and Color3.fromRGB(100, 255, 100) or Color3.fromRGB(255, 255, 255)
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Font = Enum.Font.GothamSemibold
+Title.TextSize = 22
+Title.Parent = TopBar
+
+-- Info Strip
+local INFO_H = 132
+local InfoStrip = Instance.new("Frame")
+InfoStrip.Name = "InfoStrip"
+InfoStrip.Size = UDim2.new(1, -24, 0, INFO_H)
+InfoStrip.Position = UDim2.new(0, 12, 0, 68)
+InfoStrip.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+InfoStrip.BorderSizePixel = 0
+InfoStrip.Parent = MainFrame
+Instance.new("UICorner", InfoStrip).CornerRadius = UDim.new(0, 12)
+
+local InfoPadding = Instance.new("UIPadding", InfoStrip)
+InfoPadding.PaddingTop = UDim.new(0, 10)
+InfoPadding.PaddingBottom = UDim.new(0, 10)
+InfoPadding.PaddingLeft  = UDim.new(0, 12)
+InfoPadding.PaddingRight = UDim.new(0, 12)
+
+local InfoLayout = Instance.new("UIListLayout", InfoStrip)
+InfoLayout.FillDirection = Enum.FillDirection.Vertical
+InfoLayout.SortOrder = Enum.SortOrder.LayoutOrder
+InfoLayout.Padding = UDim.new(0, 6)
+
+local function mkInfoLabel(parent, font, size, color)
+    local L = Instance.new("TextLabel")
+    L.BackgroundTransparency = 1
+    L.TextXAlignment = Enum.TextXAlignment.Left
+    L.Font = font
+    L.TextSize = size
+    L.TextColor3 = color
+    L.TextWrapped = true
+    L.AutomaticSize = Enum.AutomaticSize.Y
+    L.Size = UDim2.new(1, 0, 0, 0)
+    L.Parent = parent
+    return L
+end
+
+local TargetText    = mkInfoLabel(InfoStrip, Enum.Font.Gotham,        18, Color3.fromRGB(220,220,220)); TargetText.Text = "Target: " .. targetUsername
+local StatusTextLbl = mkInfoLabel(InfoStrip, Enum.Font.GothamSemibold,18, Color3.fromRGB(255,255,255));  StatusTextLbl.Text = "Status: Idle"
+local AttemptText   = mkInfoLabel(InfoStrip, Enum.Font.Gotham,        17, Color3.fromRGB(210,210,210));  AttemptText.Text = "Attempt: -"
+local CountdownText = mkInfoLabel(InfoStrip, Enum.Font.Gotham,        17, Color3.fromRGB(200,200,200));  CountdownText.Text = "Countdown: -"
+
+-- Bottom Area
+local BottomRow = Instance.new("Frame")
+BottomRow.Name = "BottomRow"
+BottomRow.Size = UDim2.new(1, -24, 1, - (68 + INFO_H + 22))
+BottomRow.Position = UDim2.new(0, 12, 0, 68 + INFO_H + 14)
+BottomRow.BackgroundTransparency = 1
+BottomRow.Parent = MainFrame
+local BottomLayout = Instance.new("UIListLayout", BottomRow)
+BottomLayout.FillDirection = Enum.FillDirection.Horizontal
+BottomLayout.Padding = UDim.new(0, 12)
+
+-- Pet Panel
+local PetPanel = Instance.new("Frame")
+PetPanel.Name = "PetPanel"
+PetPanel.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+PetPanel.BorderSizePixel = 0
+PetPanel.Size = UDim2.new(0.6, 0, 1, 0)
+PetPanel.Parent = BottomRow
+Instance.new("UICorner", PetPanel).CornerRadius = UDim.new(0, 12)
+
+local PetHeader = Instance.new("TextLabel")
+PetHeader.Text = "Pet Queue"
+PetHeader.Font = Enum.Font.GothamSemibold
+PetHeader.TextSize = 18
+PetHeader.TextColor3 = Color3.fromRGB(255, 255, 255)
+PetHeader.BackgroundTransparency = 1
+PetHeader.Size = UDim2.new(1, -16, 0, 28)
+PetHeader.Position = UDim2.new(0, 8, 0, 6)
+PetHeader.TextXAlignment = Enum.TextXAlignment.Left
+PetHeader.Parent = PetPanel
+
+local PetList = Instance.new("ScrollingFrame")
+PetList.Name = "PetList"
+PetList.Size = UDim2.new(1, -16, 1, - (28 + 16))
+PetList.Position = UDim2.new(0, 8, 0, 28 + 10)
+PetList.BackgroundTransparency = 1
+PetList.ScrollBarThickness = 6
+PetList.CanvasSize = UDim2.new(0, 0, 0, 0)
+PetList.Parent = PetPanel
+
+local PetListLayout = Instance.new("UIListLayout", PetList)
+PetListLayout.FillDirection = Enum.FillDirection.Vertical
+PetListLayout.Padding = UDim.new(0, 6)
+PetListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+local PetListPadding = Instance.new("UIPadding", PetList)
+PetListPadding.PaddingTop = UDim.new(0, 4)
+PetListPadding.PaddingLeft = UDim.new(0, 2)
+PetListPadding.PaddingRight = UDim.new(0, 8)
+PetListPadding.PaddingBottom = UDim.new(0, 8)
+
+-- Log Panel
+local LogPanel = Instance.new("Frame")
+LogPanel.Name = "LogPanel"
+LogPanel.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+LogPanel.BorderSizePixel = 0
+LogPanel.Size = UDim2.new(0.4, 0, 1, 0)
+LogPanel.Parent = BottomRow
+Instance.new("UICorner", LogPanel).CornerRadius = UDim.new(0, 12)
+
+local LogHeader = Instance.new("TextLabel")
+LogHeader.Text = "Notes"
+LogHeader.Font = Enum.Font.GothamSemibold
+LogHeader.TextSize = 18
+LogHeader.TextColor3 = Color3.fromRGB(255, 255, 255)
+LogHeader.BackgroundTransparency = 1
+LogHeader.Size = UDim2.new(1, -16, 0, 28)
+LogHeader.Position = UDim2.new(0, 8, 0, 6)
+LogHeader.TextXAlignment = Enum.TextXAlignment.Left
+LogHeader.Parent = LogPanel
+
+local Notes = Instance.new("TextLabel")
+Notes.BackgroundTransparency = 1
+Notes.TextXAlignment = Enum.TextXAlignment.Left
+Notes.TextYAlignment = Enum.TextYAlignment.Top
+Notes.Font = Enum.Font.Gotham
+Notes.TextSize = 16
+Notes.TextColor3 = Color3.fromRGB(210, 210, 210)
+Notes.TextWrapped = true
+Notes.Size = UDim2.new(1, -16, 1, - (28 + 12))
+Notes.Position = UDim2.new(0, 8, 0, 28 + 6)
+Notes.Text = "- Retries up to 3x per pet\n- Auto-handle favorited pets\n- Re-equips if you unhold the pet\n- Countdown shows when waiting\n- Silent recount after each trade"
+Notes.Parent = LogPanel
+
+-- Pet rows map
+local petRows = {}
+local function ensurePetRow(name)
+    if petRows[name] and petRows[name].Parent == PetList then return petRows[name] end
+    local row = Instance.new("Frame")
+    row.Name = "Row_" .. name
+    row.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+    row.BorderSizePixel = 0
+    row.Size = UDim2.new(1, 0, 0, 34)
+    row.Parent = PetList
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    local pad = Instance.new("UIPadding", row)
+    pad.PaddingLeft = UDim.new(0, 10)
+    pad.PaddingRight = UDim.new(0, 10)
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Name = "Name"
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    nameLbl.Font = Enum.Font.GothamSemibold
+    nameLbl.TextSize = 16
+    nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLbl.Text = name
+    nameLbl.Size = UDim2.new(0.6, 0, 1, 0)
+    nameLbl.Parent = row
+
+    local countLbl = Instance.new("TextLabel")
+    countLbl.Name = "Count"
+    countLbl.BackgroundTransparency = 1
+    countLbl.TextXAlignment = Enum.TextXAlignment.Right
+    countLbl.Font = Enum.Font.Gotham
+    countLbl.TextSize = 16
+    countLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    countLbl.Text = "-"
+    countLbl.Size = UDim2.new(0.4, 0, 1, 0)
+    countLbl.Position = UDim2.new(0.6, 0, 0, 0)
+    countLbl.Parent = row
+
+    petRows[name] = row
+    PetList.CanvasSize = UDim2.new(0, 0, 0, PetListLayout.AbsoluteContentSize.Y + 12)
+    return row
+end
+
+-- Floating buttons: create with placeholder positions then update
+local guiVisible = true
+local ToggleButton = Instance.new("TextButton")
+ToggleButton.Name = "ToggleGUIButton"
+ToggleButton.Size = UDim2.fromOffset(32, 32)
+ToggleButton.Position = UDim2.fromOffset(0, 0) -- placeholder; updated below
+ToggleButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.Text = "◉"
+ToggleButton.Font = Enum.Font.GothamBold
+ToggleButton.TextSize = 18
+ToggleButton.Parent = ScreenGui
+Instance.new("UICorner", ToggleButton).CornerRadius = UDim.new(1, 0)
+
+local tbStroke = Instance.new("UIStroke")
+tbStroke.Thickness = 2
+tbStroke.Color = Color3.fromRGB(70, 70, 70)
+tbStroke.Parent = ToggleButton
+
+local WhiteScreenButton = Instance.new("TextButton")
+WhiteScreenButton.Name = "WhiteScreenButton"
+WhiteScreenButton.Size = UDim2.fromOffset(50, 32)
+WhiteScreenButton.Position = UDim2.fromOffset(0, 0) -- placeholder
+WhiteScreenButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+WhiteScreenButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+WhiteScreenButton.Text = "WS"
+WhiteScreenButton.Font = Enum.Font.GothamSemibold
+WhiteScreenButton.TextSize = 14
+WhiteScreenButton.Parent = ScreenGui
+Instance.new("UICorner", WhiteScreenButton).CornerRadius = UDim.new(0, 8)
+
+local wsStroke = Instance.new("UIStroke")
+wsStroke.Thickness = 2
+wsStroke.Color = Color3.fromRGB(70, 70, 70)
+wsStroke.Parent = WhiteScreenButton
+
+-- Update floating button positions when MainFrame moves/initializes
+local function updateFloatingButtons()
+    local x = MainFrame.AbsolutePosition.X
+    local y = MainFrame.AbsolutePosition.Y
+    local w = MainFrame.AbsoluteSize.X
+    ToggleButton.Position = UDim2.fromOffset(x + w - 32, y - 5)
+    WhiteScreenButton.Position = UDim2.fromOffset(x + w - 90, y - 5)
+end
+-- connect and call once after a frame to ensure AbsolutePosition is valid
+MainFrame:GetPropertyChangedSignal("AbsolutePosition"):Connect(updateFloatingButtons)
+task.defer(function() task.wait(0.05); updateFloatingButtons() end)
+
+-- UI Visibility Management
+function updateUIVisibility()
+    if whiteScreenEnabled then
+        ScreenGui.Enabled = false
+        if not whiteScreenGui then createWhiteScreen() end
+        if whiteScreenGui then whiteScreenGui.Enabled = true end
+        WhiteScreenButton.BackgroundColor3 = Color3.fromRGB(100, 200, 100)
+    else
+        ScreenGui.Enabled = true
+        if whiteScreenGui then whiteScreenGui.Enabled = false end
+        WhiteScreenButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    end
+end
+
+ToggleButton.MouseButton1Click:Connect(function()
+    guiVisible = not guiVisible
+    MainFrame.Visible = guiVisible
+    ToggleButton.Text = guiVisible and "◉" or "○"
+end)
+
+WhiteScreenButton.MouseButton1Click:Connect(function()
+    whiteScreenEnabled = not whiteScreenEnabled
+    updateUIVisibility()
+end)
+
+-- Initialize UI
+if whiteScreen then createWhiteScreen() end
+updateUIVisibility()
+
+-- =========================================================
+-- UI helpers
+-- =========================================================
+local function updateStatus(text)
+    StatusTextLbl.Text = "Status: " .. text
+    if whiteScreenEnabled and whiteScreenText then
+        whiteScreenText.Text = text
+    end
+end
+
+local function updateAttempt(attempt, maxAttempts)
+    AttemptText.Text = string.format("Attempt: %d/%d", attempt, maxAttempts)
+end
+
+local function updateCountdownText(text)
+    CountdownText.Text = "Countdown: " .. text
+end
+
+local function updatePetCount(petName, count)
+    petStatus[petName] = count == 0 and "Completed" or tostring(count)
+    ensurePetRow(petName)
+    local row = petRows[petName]
+    if row and row:FindFirstChild("Count") then
+        row.Count.Text = petStatus[petName]
+    end
+end
+
+-- =========================================================
+-- Logic helpers (unchanged behavior)
+-- =========================================================
+local function baseName(str)
+    local n = str:match("^([^[]+)")
+    return n and n:match("^%s*(.-)%s*$") or str
+end
+
+local function unequipAllPets()
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer.Backpack
+    if not char or not backpack then return end
+    for _, itm in ipairs(char:GetChildren()) do
+        if itm:IsA("Tool") then
+            itm.Parent = backpack
+        end
+    end
+end
+
+local function getAllPetsFromInventory()
+    local allPets = {}
+    local petCounts = {}
+    local backpack = LocalPlayer.Backpack
+    local character = LocalPlayer.Character
+
+    if not backpack or not character then return {} end
+
+    local excludeItems = {
+        "Watering Can", "Fertilizer", "Shovel", "Hoe", "Rake", "Scissors",
+        "Seed", "Plant", "Flower", "Tree", "Bush", "Grass", "Dirt", "Water",
+        "Tool", "Bucket", "Pot", "Garden", "Farm", "Crop", "Harvest"
     }
-    local config = getgenv().AutoTradeConfig
 
-    -- Create UI (dark theme, draggable, minimize)
-    local CoreGui = game:GetService("CoreGui")
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "GAG_AutoTrade_UI"
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.Parent = CoreGui
-
-    local main = Instance.new("Frame")
-    main.Name = "Main"
-    main.Size = UDim2.fromOffset(380, 480)
-    main.Position = UDim2.new(0.5, -190, 0.5, -240)
-    main.AnchorPoint = Vector2.new(0.5, 0.5)
-    main.BackgroundColor3 = Color3.fromRGB(25,25,25)
-    main.Parent = ScreenGui
-    main.Active = true
-    main.Draggable = true
-    Instance.new("UICorner", main).CornerRadius = UDim.new(0,12)
-
-    local title = Instance.new("TextLabel")
-    title.Parent = main
-    title.Size = UDim2.new(1,0,0,34)
-    title.Position = UDim2.new(0,0,0,0)
-    title.BackgroundColor3 = Color3.fromRGB(40,40,40)
-    title.Text = "GAG-Style Auto Trade (Your Game)"
-    title.TextColor3 = Color3.fromRGB(255,255,255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 18
-    Instance.new("UICorner", title).CornerRadius = UDim.new(0,12)
-
-    -- Minimize button
-    local minimizeBtn = Instance.new("TextButton")
-    minimizeBtn.Parent = main
-    minimizeBtn.Size = UDim2.fromOffset(30,30)
-    minimizeBtn.Position = UDim2.new(1,-36,0,2)
-    minimizeBtn.Text = "-"
-    minimizeBtn.Font = Enum.Font.GothamBold
-    minimizeBtn.TextSize = 20
-    minimizeBtn.BackgroundColor3 = Color3.fromRGB(65,65,65)
-    minimizeBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0,6)
-
-    local minimized = false
-    local function setMinimized(v)
-        minimized = v
-        for _,child in ipairs(main:GetChildren()) do
-            if child ~= title and child ~= minimizeBtn then
-                child.Visible = not minimized
+    local function isPet(itemName)
+        local basePetName = baseName(itemName)
+        for _, excludeWord in ipairs(excludeItems) do
+            if string.find(basePetName:lower(), excludeWord:lower()) then
+                return false
             end
         end
-        minimizeBtn.Text = minimized and "+" or "-"
-        main.Size = minimized and UDim2.fromOffset(380,40) or UDim2.fromOffset(380,480)
+        return true
     end
 
-    minimizeBtn.MouseButton1Click:Connect(function()
-        setMinimized(not minimized)
-    end)
-
-    -- Target dropdown
-    local dropdown = Instance.new("Frame")
-    dropdown.Parent = main
-    dropdown.Size = UDim2.new(1,-24,0,40)
-    dropdown.Position = UDim2.new(0,12,0,44)
-    dropdown.BackgroundColor3 = Color3.fromRGB(35,35,35)
-    Instance.new("UICorner", dropdown).CornerRadius = UDim.new(0,8)
-
-    local dropLabel = Instance.new("TextButton")
-    dropLabel.Parent = dropdown
-    dropLabel.Size = UDim2.fromScale(1,1)
-    dropLabel.Text = "Select target player"
-    dropLabel.Font = Enum.Font.Gotham
-    dropLabel.TextSize = 16
-    dropLabel.TextColor3 = Color3.fromRGB(255,255,255)
-    dropLabel.BackgroundTransparency = 1
-
-    local dropList = Instance.new("ScrollingFrame")
-    dropList.Parent = dropdown
-    dropList.Size = UDim2.new(1,0,0,0)
-    dropList.Position = UDim2.new(0,0,1,2)
-    dropList.BackgroundColor3 = Color3.fromRGB(45,45,45)
-    dropList.BorderSizePixel = 0
-    dropList.ScrollBarThickness = 6
-    dropList.Visible = false
-    Instance.new("UICorner", dropList).CornerRadius = UDim.new(0,8)
-
-    local dropLayout = Instance.new("UIListLayout")
-    dropLayout.Parent = dropList
-    dropLayout.Padding = UDim.new(0,2)
-
-    local function refreshPlayerList()
-        for _,c in ipairs(dropList:GetChildren()) do
-            if c:IsA("TextButton") then c:Destroy() end
-        end
-        for _,p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then
-                local btn = Instance.new("TextButton")
-                btn.Parent = dropList
-                btn.Size = UDim2.new(1,0,0,26)
-                btn.Text = p.Name
-                btn.Font = Enum.Font.Gotham
-                btn.TextSize = 14
-                btn.TextColor3 = Color3.fromRGB(255,255,255)
-                btn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-                btn.MouseButton1Click:Connect(function()
-                    config.targetUsername = p.Name
-                    dropLabel.Text = "Target: " .. p.Name
-                    dropList.Visible = false
-                    dropList.Size = UDim2.new(1,0,0,0)
-                end)
+    for _, pet in ipairs(backpack:GetChildren()) do
+        if pet:IsA("Tool") and isPet(pet.Name) then
+            local petName = baseName(pet.Name)
+            if not petCounts[petName] then
+                petCounts[petName] = true
+                table.insert(allPets, petName)
             end
         end
     end
 
-    dropLabel.MouseButton1Click:Connect(function()
-        dropList.Visible = not dropList.Visible
-        refreshPlayerList()
-        if dropList.Visible then
-            dropList.Size = UDim2.new(1,0,0, math.clamp(#Players:GetPlayers()*26, 26, 260))
-        else
-            dropList.Size = UDim2.new(1,0,0,0)
+    for _, pet in ipairs(character:GetChildren()) do
+        if pet:IsA("Tool") and isPet(pet.Name) then
+            local petName = baseName(pet.Name)
+            if not petCounts[petName] then
+                petCounts[petName] = true
+                table.insert(allPets, petName)
+            end
+        end
+    end
+
+    return allPets
+end
+
+local function countPetsInBackpack(petName)
+    local count = 0
+    local backpack = LocalPlayer.Backpack
+    local character = LocalPlayer.Character
+    if not backpack or not character then return 0 end
+    for _, pet in ipairs(backpack:GetChildren()) do
+        if baseName(pet.Name) == petName then count = count + 1 end
+    end
+    for _, pet in ipairs(character:GetChildren()) do
+        if baseName(pet.Name) == petName then count = count + 1 end
+    end
+    return count
+end
+
+local function refreshCountsFor(petName)
+    task.defer(function()
+        task.wait(0.2)
+        updatePetCount(petName, countPetsInBackpack(petName))
+        task.wait(0.8)
+        updatePetCount(petName, countPetsInBackpack(petName))
+    end)
+end
+
+local function refreshAllCounts()
+    task.defer(function()
+        task.wait(0.2)
+        local petsToRefresh = tradeWholeInventory and getAllPetsFromInventory() or petToGive
+        for _, name in ipairs(petsToRefresh) do
+            updatePetCount(name, countPetsInBackpack(name))
+        end
+        task.wait(0.8)
+        petsToRefresh = tradeWholeInventory and getAllPetsFromInventory() or petToGive
+        for _, name in ipairs(petsToRefresh) do
+            updatePetCount(name, countPetsInBackpack(name))
         end
     end)
+end
 
-    Players.PlayerAdded:Connect(function() refreshPlayerList() end)
-    Players.PlayerRemoving:Connect(function() refreshPlayerList() end)
+local function initializePetCounts()
+    updateStatus("Initializing...")
+    task.wait(1)
 
-    -- Pet list area
-    local petFrame = Instance.new("ScrollingFrame")
-    petFrame.Parent = main
-    petFrame.Size = UDim2.new(1,-24,1, -240)
-    petFrame.Position = UDim2.new(0,12,0,96)
-    petFrame.BackgroundColor3 = Color3.fromRGB(35,35,35)
-    petFrame.BorderSizePixel = 0
-    petFrame.ScrollBarThickness = 6
-    Instance.new("UICorner", petFrame).CornerRadius = UDim.new(0,8)
+    local petsToProcess = tradeWholeInventory and getAllPetsFromInventory() or petToGive
 
-    local petLayout = Instance.new("UIListLayout")
-    petLayout.Parent = petFrame
-    petLayout.Padding = UDim.new(0,6)
+    for _, petName in ipairs(petsToProcess) do
+        ensurePetRow(petName)
+        updatePetCount(petName, countPetsInBackpack(petName))
+    end
+    updateCountdownText("-")
+    updateAttempt(0, 3)
+end
 
-    local function refreshPetList()
-        for _,c in ipairs(petFrame:GetChildren()) do
-            if c:IsA("TextButton") then c:Destroy() end
+-- =========================================================
+-- Remotes (safe lookups)
+-- =========================================================
+local GameEvents = ReplicatedStorage:FindFirstChild("GameEvents")
+local function safeRemote(name)
+    if GameEvents and GameEvents:FindFirstChild(name) then
+        return GameEvents[name]
+    end
+    return nil
+end
+
+local PetGiftingService = safeRemote("PetGiftingService")
+local Notification = safeRemote("Notification")
+local Favorite_Item = safeRemote("Favorite_Item")
+local GiftPet = safeRemote("GiftPet")
+local AcceptPetGift = safeRemote("AcceptPetGift")
+
+if not PetGiftingService then
+    warn("PetGiftingService remote not found. Trading will not work.")
+end
+if not Notification then
+    warn("Notification remote not found. Script will continue but some feedback may be missing.")
+end
+
+-- =========================================================
+-- Receiver mode (keeps behavior, but guarded)
+-- =========================================================
+if isReceiver then
+    updateStatus("Receiver mode")
+    updateCountdownText("Ready")
+
+    local totalReceived = 0
+
+    local function refreshReceiverCounts()
+        local allPets = getAllPetsFromInventory()
+        for _, petName in ipairs(allPets) do
+            local count = countPetsInBackpack(petName)
+            updatePetCount(petName, count)
         end
-        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-        if not backpack then return end
-        for _,tool in ipairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") then
-                local btn = Instance.new("TextButton")
-                btn.Parent = petFrame
-                btn.Size = UDim2.new(1,0,0,30)
-                btn.Text = tool.Name
-                btn.Font = Enum.Font.Gotham
-                btn.TextSize = 14
-                btn.TextColor3 = Color3.fromRGB(255,255,255)
-                btn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-                Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
-                btn.MouseButton1Click:Connect(function()
-                    local idx = table.find(config.selectedPets, tool.Name)
-                    if idx then
-                        table.remove(config.selectedPets, idx)
-                        btn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-                    else
-                        table.insert(config.selectedPets, tool.Name)
-                        btn.BackgroundColor3 = Color3.fromRGB(35,140,70)
+        updatePetCount("Total Received", totalReceived)
+    end
+
+    local function initializeReceiverCounts()
+        ensurePetRow("Total Received")
+        updatePetCount("Total Received", 0)
+        refreshReceiverCounts()
+    end
+
+    initializeReceiverCounts()
+
+    local receiverTradeProcessing = false
+    local currentTradePet = nil
+
+    if GiftPet and AcceptPetGift then
+        GiftPet.OnClientEvent:Connect(function(petId, petName, senderName)
+            if receiverTradeProcessing then return end
+            receiverTradeProcessing = true
+            currentTradePet = petName
+            updateStatus("Receiving trade")
+            updateCountdownText("Processing")
+            -- auto-accept
+            pcall(function() AcceptPetGift:FireServer(true, petId) end)
+        end)
+    end
+
+    if Notification then
+        Notification.OnClientEvent:Connect(function(message)
+            if receiverTradeProcessing and type(message) == "string" then
+                if message == "Trade completed!" or message == "Trade complete" or message == "Trade Complete" then
+                    receiverTradeProcessing = false
+                    if currentTradePet then
+                        totalReceived = totalReceived + 1
+                        currentTradePet = nil
+                        task.defer(function()
+                            task.wait(0.5)
+                            refreshReceiverCounts()
+                        end)
                     end
-                end)
-            end
-        end
-    end
-
-    refreshPetList()
-    LocalPlayer.Backpack.ChildAdded:Connect(refreshPetList)
-    LocalPlayer.Backpack.ChildRemoved:Connect(refreshPetList)
-
-    -- Controls (toggle all + start)
-    local toggleAll = Instance.new("TextButton")
-    toggleAll.Parent = main
-    toggleAll.Size = UDim2.new(1,-24,0,40)
-    toggleAll.Position = UDim2.new(0,12,1,-130)
-    toggleAll.Text = "Trade Full Inventory: OFF"
-    toggleAll.Font = Enum.Font.Gotham
-    toggleAll.TextSize = 16
-    toggleAll.BackgroundColor3 = Color3.fromRGB(60,60,60)
-    toggleAll.TextColor3 = Color3.fromRGB(255,255,255)
-    Instance.new("UICorner", toggleAll).CornerRadius = UDim.new(0,8)
-
-    local startBtn = Instance.new("TextButton")
-    startBtn.Parent = main
-    startBtn.Size = UDim2.new(1,-24,0,46)
-    startBtn.Position = UDim2.new(0,12,1,-78)
-    startBtn.Text = "Start Trading"
-    startBtn.Font = Enum.Font.GothamBold
-    startBtn.TextSize = 18
-    startBtn.BackgroundColor3 = Color3.fromRGB(90,90,90)
-    startBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    Instance.new("UICorner", startBtn).CornerRadius = UDim.new(0,8)
-
-    local status = Instance.new("TextLabel")
-    status.Parent = main
-    status.Size = UDim2.new(1,-24,0,20)
-    status.Position = UDim2.new(0,12,1,-160)
-    status.BackgroundTransparency = 1
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 14
-    status.TextColor3 = Color3.fromRGB(255,255,255)
-    status.Text = "Status: Idle"
-
-    toggleAll.MouseButton1Click:Connect(function()
-        config.tradeWholeInventory = not config.tradeWholeInventory
-        toggleAll.Text = "Trade Full Inventory: " .. (config.tradeWholeInventory and "ON" or "OFF")
-    end)
-
-    -- send trade request to server; data uses GAG-style table
-    local function sendTrade(petName, target)
-        status.Text = "Sending " .. petName .. "..."
-        Trade_RE:FireServer({
-            Action = "GivePet",
-            Target = target,       -- can be player instance or name string (server accepts both)
-            PetName = petName
-        })
-        -- Give UI a little breathing room
-        task.wait(0.35)
-    end
-
-    startBtn.MouseButton1Click:Connect(function()
-        if config.targetUsername == "" then
-            status.Text = "Select a target first."
-            return
-        end
-        local targetPlayer = Players:FindFirstChild(config.targetUsername)
-        if not targetPlayer then
-            status.Text = "Target not found."
-            return
-        end
-
-        local pets = {}
-        if config.tradeWholeInventory then
-            local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-            if backpack then
-                for _,t in ipairs(backpack:GetChildren()) do
-                    if t:IsA("Tool") then table.insert(pets, t.Name) end
+                    updateStatus("Trade completed")
+                    updateCountdownText("Ready")
+                    task.wait(1)
+                    updateStatus("Ready for next trade")
                 end
             end
-        else
-            pets = table.create(#config.selectedPets)
-            for i,v in ipairs(config.selectedPets) do pets[i] = v end
-        end
+        end)
+    end
 
-        if #pets == 0 then
-            status.Text = "No pets selected."
-            return
+    task.spawn(function()
+        while isReceiver do
+            if not receiverTradeProcessing then
+                refreshReceiverCounts()
+            end
+            task.wait(10)
         end
-
-        for _,petName in ipairs(pets) do
-            sendTrade(petName, targetPlayer)
-        end
-        status.Text = "Trade requests sent."
     end)
 
-    -- Listen for Notification events from server
-    Notification.OnClientEvent:Connect(function(msg)
-        status.Text = tostring(msg)
-    end)
+    while isReceiver do
+        task.wait(15)
+    end
+    return
+end
 
-    -- Helpful console message
-    print("[AutoTrade] Client UI loaded. Use the dropdown to choose a target and trade pets.")
+-- Notification listener (guarded)
+if Notification then
+    Notification.OnClientEvent:Connect(function(message)
+        if type(message) == "string" then
+            if message == "Trade completed!" or message == "Trade complete" or message == "Trade Complete" then
+                tradeAccepted = true
+                refreshAllCounts()
+            elseif message == "Cannot gift a favorited pet!" then
+                favoriteBlocked = true
+            elseif message == "You are not holding a tool!" then
+                notHoldingTool = true
+            end
+        end
+    end)
+end
+
+-- Equip helper
+local function equipPet(petName)
+    local backpack = LocalPlayer.Backpack
+    for _, pet in ipairs(backpack:GetChildren()) do
+        if pet:IsA("Tool") and baseName(pet.Name) == petName then
+            pet.Parent = LocalPlayer.Character
+            task.wait(0.5)
+            return pet
+        end
+    end
+    return nil
+end
+
+-- Countdown helper
+local function countdownWithAbort(totalSeconds, fmt)
+    for i = totalSeconds, 1, -1 do
+        if tradeAccepted then return true end
+        updateCountdownText(string.format(fmt, i))
+        task.wait(1)
+        if tradeAccepted then return true end
+    end
+    updateCountdownText("-")
+    return false
+end
+
+-- Trade logic
+local function tradePet(targetPlayer, petName)
+    if not PetGiftingService then
+        updateStatus("No gifting remote")
+        return false
+    end
+
+    local maxAttempts = 3
+    local currentAttempt = 1
+
+    while currentAttempt <= maxAttempts do
+        updateStatus(string.format("Trading %s", petName))
+        updateAttempt(currentAttempt, maxAttempts)
+
+        tradeAccepted = false
+        favoriteBlocked = false
+        notHoldingTool = false
+
+        while true do
+            local char = LocalPlayer.Character
+            local holding = false
+            if char then
+                for _, tool in ipairs(char:GetChildren()) do
+                    if tool:IsA("Tool") and baseName(tool.Name) == petName then
+                        holding = true
+                        break
+                    end
+                end
+            end
+            if not holding then
+                updateStatus("Equiping Pet")
+                unequipAllPets()
+                local ok = equipPet(petName)
+                if not ok then break end
+            end
+
+            -- send
+            pcall(function() PetGiftingService:FireServer("GivePet", targetPlayer) end)
+
+            local startTime = tick()
+            local timeout = 5
+            while (tick() - startTime) < timeout and not tradeAccepted and not favoriteBlocked and not notHoldingTool do
+                task.wait(0.5)
+            end
+
+            if tradeAccepted then
+                updateCountdownText("-")
+                refreshCountsFor(petName)
+                return true
+            end
+
+            if favoriteBlocked then
+                updateStatus("Pet favorited → unfavoriting")
+                local ch = LocalPlayer.Character
+                if ch and Favorite_Item then
+                    for _, tool in ipairs(ch:GetChildren()) do
+                        if tool:IsA("Tool") then
+                            pcall(function() Favorite_Item:FireServer(tool) end)
+                        end
+                    end
+                end
+                countdownWithAbort(2, "Retrying in %d seconds...")
+                favoriteBlocked = false
+                notHoldingTool = false
+                tradeAccepted = false
+                -- retry inner loop
+            elseif notHoldingTool then
+                updateStatus("Equiping Pet")
+                unequipAllPets()
+                equipPet(petName)
+                task.wait(0.5)
+                notHoldingTool = false
+                tradeAccepted = false
+                favoriteBlocked = false
+                -- retry inner loop
+            else
+                break
+            end
+        end
+
+        currentAttempt = currentAttempt + 1
+        if currentAttempt <= maxAttempts then
+            countdownWithAbort(5, string.format("Retrying in %%d seconds... (after attempt %d)", currentAttempt - 1))
+        end
+    end
+
+    updateStatus(string.format("Failed to trade %s after 3 attempts", petName))
+    updateCountdownText("-")
+    return false
+end
+
+-- Find target player
+updateStatus("Looking for target...")
+local foundPlayer = nil
+while not foundPlayer do
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Name == targetUsername then
+            foundPlayer = player
+            updateStatus("Found player")
+            break
+        end
+    end
+    task.wait(1)
+end
+
+-- Init
+initializePetCounts()
+
+local function checkRemainingPets()
+    local petsToCheck = tradeWholeInventory and getAllPetsFromInventory() or petToGive
+    for _, petName in ipairs(petsToCheck) do
+        if countPetsInBackpack(petName) > 0 then return true end
+    end
+    return false
+end
+
+-- Main loop
+while true do
+    updateStatus("Starting trade cycle")
+    local anythingTraded = false
+
+    local currentPetList = tradeWholeInventory and getAllPetsFromInventory() or petToGive
+
+    for _, petName in ipairs(currentPetList) do
+        updateStatus("Processing " .. petName)
+        unequipAllPets()
+
+        while true do
+            local petsLeft = countPetsInBackpack(petName)
+            updatePetCount(petName, petsLeft)
+            if petsLeft == 0 then
+                updateStatus("No more " .. petName .. " left")
+                break
+            end
+
+            local eq = equipPet(petName)
+            if eq then
+                local ok = tradePet(foundPlayer, petName)
+                if ok then
+                    anythingTraded = true
+                    updateStatus("Successfully traded " .. petName)
+                    countdownWithAbort(2, "Cooldown %d...")
+                else
+                    unequipAllPets()
+                    break
+                end
+            else
+                updateStatus("Failed to equip " .. petName)
+                countdownWithAbort(5, "Retrying in %d seconds...")
+                break
+            end
+        end
+    end
+
+    if not checkRemainingPets() then
+        updateStatus("All pets traded")
+        updateCountdownText("-")
+        break
+    end
+
+    if not anythingTraded then
+        countdownWithAbort(10, "Retrying in %d seconds...")
+    else
+        countdownWithAbort(3, "Next cycle in %d seconds...")
+    end
+end
+
+updateStatus("Trading completed")
+updateCountdownText("-")
+
+if leaveWhenDone then
+    updateStatus("Leaving game...")
+    updateCountdownText("5")
+    task.wait(1)
+    updateCountdownText("4")
+    task.wait(1)
+    updateCountdownText("3")
+    task.wait(1)
+    updateCountdownText("2")
+    task.wait(1)
+    updateCountdownText("1")
+    task.wait(1)
+    updateCountdownText("Goodbye!")
+    task.wait(0.5)
+    pcall(function() game:Shutdown() end)
+else
+    updateStatus("Completed - Staying in game")
+    updateCountdownText("Complete")
 end
