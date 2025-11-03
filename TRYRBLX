@@ -1,295 +1,103 @@
---[[
-    GROW A GARDEN STYLE - AUTO TRADE ALL PETS
-    Unified Client + Server Script
-    Author style: depso (depthso)
-    Version: Final (with target dropdown)
-]]
+--// GAG-Style Auto Trade (Safe Simulation)
+--// For your own local testing and UI structure
 
-----------------------------------------------------------------
---// SHARED SETUP
-----------------------------------------------------------------
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
 
-local GameEvents = ReplicatedStorage:FindFirstChild("GameEvents") or Instance.new("Folder", ReplicatedStorage)
+-- Simulated GameEvents
+local GameEvents = ReplicatedStorage:FindFirstChild("GameEvents") or Instance.new("Folder")
 GameEvents.Name = "GameEvents"
 GameEvents.Parent = ReplicatedStorage
 
 local Trade_RE = GameEvents:FindFirstChild("Trade_RE") or Instance.new("RemoteEvent", GameEvents)
 Trade_RE.Name = "Trade_RE"
+local GiftPet_RE = GameEvents:FindFirstChild("GiftPet_RE") or Instance.new("RemoteEvent", GameEvents)
+GiftPet_RE.Name = "GiftPet_RE"
+local TradeHandler = GameEvents:FindFirstChild("TradeHandler") or Instance.new("RemoteEvent", GameEvents)
+TradeHandler.Name = "TradeHandler"
 
-local Notification = GameEvents:FindFirstChild("Notification") or Instance.new("RemoteEvent", GameEvents)
-Notification.Name = "Notification"
-
-----------------------------------------------------------------
---// CLIENT SIDE UI + FUNCTION
-----------------------------------------------------------------
-if game:GetService("RunService"):IsClient() then
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-    local UserInputService = game:GetService("UserInputService")
-
-    -- Config
-    getgenv().AutoTradeConfig = getgenv().AutoTradeConfig or {
-        targetUsername = "",
-        tradeWholeInventory = false,
-        selectedPets = {}
-    }
-    local config = getgenv().AutoTradeConfig
-
-    -- UI
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "GAG_TradeUI"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.Parent = game:GetService("CoreGui")
-
-    local main = Instance.new("Frame")
-    main.Size = UDim2.fromOffset(360, 460)
-    main.Position = UDim2.new(0.5, -180, 0.5, -230)
-    main.BackgroundColor3 = Color3.fromRGB(25,25,25)
-    main.Active = true
-    main.Draggable = true
-    main.Parent = gui
-    Instance.new("UICorner", main).CornerRadius = UDim.new(0,12)
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1,0,0,32)
-    title.Text = "GAG Auto Trade"
-    title.TextColor3 = Color3.new(1,1,1)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 18
-    title.BackgroundColor3 = Color3.fromRGB(40,40,40)
-    title.Parent = main
-    Instance.new("UICorner", title).CornerRadius = UDim.new(0,12)
-
-    local minimize = Instance.new("TextButton")
-    minimize.Text = "-"
-    minimize.Size = UDim2.fromOffset(28,28)
-    minimize.Position = UDim2.new(1,-34,0,2)
-    minimize.BackgroundColor3 = Color3.fromRGB(60,60,60)
-    minimize.TextColor3 = Color3.new(1,1,1)
-    minimize.Font = Enum.Font.GothamBold
-    minimize.TextSize = 20
-    minimize.Parent = main
-    Instance.new("UICorner", minimize).CornerRadius = UDim.new(0,8)
-
-    -- Dropdown Target Player
-    local dropdown = Instance.new("Frame")
-    dropdown.Size = UDim2.new(1,-24,0,36)
-    dropdown.Position = UDim2.new(0,12,0,42)
-    dropdown.BackgroundColor3 = Color3.fromRGB(35,35,35)
-    dropdown.Parent = main
-    Instance.new("UICorner", dropdown).CornerRadius = UDim.new(0,8)
-
-    local dropLabel = Instance.new("TextButton")
-    dropLabel.Size = UDim2.fromScale(1,1)
-    dropLabel.BackgroundTransparency = 1
-    dropLabel.TextColor3 = Color3.new(1,1,1)
-    dropLabel.Font = Enum.Font.Gotham
-    dropLabel.TextSize = 16
-    dropLabel.Text = "Select Target Player"
-    dropLabel.Parent = dropdown
-
-    local dropList = Instance.new("Frame")
-    dropList.Size = UDim2.new(1,0,0,0)
-    dropList.Position = UDim2.new(0,0,1,2)
-    dropList.BackgroundColor3 = Color3.fromRGB(45,45,45)
-    dropList.Visible = false
-    dropList.Parent = dropdown
-    Instance.new("UICorner", dropList).CornerRadius = UDim.new(0,6)
-
-    local listLayout = Instance.new("UIListLayout")
-    listLayout.Padding = UDim.new(0,2)
-    listLayout.Parent = dropList
-
-    local function refreshPlayerList()
-        for _,c in ipairs(dropList:GetChildren()) do
-            if c:IsA("TextButton") then c:Destroy() end
-        end
-        for _,p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(1,0,0,24)
-                btn.Text = p.Name
-                btn.TextColor3 = Color3.new(1,1,1)
-                btn.BackgroundColor3 = Color3.fromRGB(55,55,55)
-                btn.Font = Enum.Font.Gotham
-                btn.TextSize = 14
-                btn.Parent = dropList
-                btn.MouseButton1Click:Connect(function()
-                    config.targetUsername = p.Name
-                    dropLabel.Text = "Target: "..p.Name
-                    dropList.Visible = false
-                    dropList.Size = UDim2.new(1,0,0,0)
-                end)
-            end
-        end
-    end
-    refreshPlayerList()
-
-    dropLabel.MouseButton1Click:Connect(function()
-        dropList.Visible = not dropList.Visible
-        refreshPlayerList()
-        dropList.Size = dropList.Visible and UDim2.new(1,0,0,#Players:GetPlayers()*26) or UDim2.new(1,0,0,0)
-    end)
-
-    -- Pet List Frame
-    local petFrame = Instance.new("ScrollingFrame")
-    petFrame.Size = UDim2.new(1,-24,1,-200)
-    petFrame.Position = UDim2.new(0,12,0,90)
-    petFrame.BackgroundColor3 = Color3.fromRGB(35,35,35)
-    petFrame.ScrollBarThickness = 6
-    petFrame.BorderSizePixel = 0
-    petFrame.Parent = main
-    Instance.new("UICorner", petFrame).CornerRadius = UDim.new(0,8)
-
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0,5)
-    layout.Parent = petFrame
-
-    -- Toggle full inventory
-    local toggleAll = Instance.new("TextButton")
-    toggleAll.Size = UDim2.new(1,-24,0,36)
-    toggleAll.Position = UDim2.new(0,12,1,-96)
-    toggleAll.Text = "Trade Full Inventory: OFF"
-    toggleAll.Font = Enum.Font.Gotham
-    toggleAll.TextSize = 16
-    toggleAll.TextColor3 = Color3.new(1,1,1)
-    toggleAll.BackgroundColor3 = Color3.fromRGB(60,60,60)
-    toggleAll.Parent = main
-    Instance.new("UICorner", toggleAll).CornerRadius = UDim.new(0,8)
-
-    -- Start button
-    local start = Instance.new("TextButton")
-    start.Size = UDim2.new(1,-24,0,40)
-    start.Position = UDim2.new(0,12,1,-50)
-    start.Text = "Start Trading"
-    start.Font = Enum.Font.GothamBold
-    start.TextSize = 18
-    start.TextColor3 = Color3.new(1,1,1)
-    start.BackgroundColor3 = Color3.fromRGB(90,90,90)
-    start.Parent = main
-    Instance.new("UICorner", start).CornerRadius = UDim.new(0,8)
-
-    local status = Instance.new("TextLabel")
-    status.Size = UDim2.new(1,-24,0,20)
-    status.Position = UDim2.new(0,12,1,-135)
-    status.BackgroundTransparency = 1
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 14
-    status.TextColor3 = Color3.new(1,1,1)
-    status.Text = "Status: Idle"
-    status.Parent = main
-
-    local minimized = false
-    minimize.MouseButton1Click:Connect(function()
-        minimized = not minimized
-        for _,v in ipairs(main:GetChildren()) do
-            if v ~= title and v ~= minimize then v.Visible = not minimized end
-        end
-        minimize.Text = minimized and "+" or "-"
-        main.Size = minimized and UDim2.fromOffset(360,40) or UDim2.fromOffset(360,460)
-    end)
-
-    local function refreshList()
-        for _,c in ipairs(petFrame:GetChildren()) do
-            if c:IsA("TextButton") then c:Destroy() end
-        end
-        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-        if not backpack then return end
-        for _,tool in ipairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") then
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(1,0,0,28)
-                btn.Text = tool.Name
-                btn.Font = Enum.Font.Gotham
-                btn.TextSize = 14
-                btn.TextColor3 = Color3.new(1,1,1)
-                btn.BackgroundColor3 = Color3.fromRGB(55,55,55)
-                btn.Parent = petFrame
-                Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
-                btn.MouseButton1Click:Connect(function()
-                    local found = table.find(config.selectedPets, tool.Name)
-                    if found then
-                        table.remove(config.selectedPets, found)
-                        btn.BackgroundColor3 = Color3.fromRGB(55,55,55)
-                    else
-                        table.insert(config.selectedPets, tool.Name)
-                        btn.BackgroundColor3 = Color3.fromRGB(30,150,70)
-                    end
-                end)
-            end
-        end
-    end
-    refreshList()
-    LocalPlayer.Backpack.ChildAdded:Connect(refreshList)
-    LocalPlayer.Backpack.ChildRemoved:Connect(refreshList)
-
-    toggleAll.MouseButton1Click:Connect(function()
-        config.tradeWholeInventory = not config.tradeWholeInventory
-        toggleAll.Text = "Trade Full Inventory: " .. (config.tradeWholeInventory and "ON" or "OFF")
-    end)
-
-    local function sendTrade(petName, target)
-        status.Text = "Sending " .. petName .. "..."
-        Trade_RE:FireServer({
-            Action = "GivePet",
-            Target = target,
-            PetName = petName
-        })
-        task.wait(0.4)
-    end
-
-    start.MouseButton1Click:Connect(function()
-        local target = Players:FindFirstChild(config.targetUsername)
-        if not target then
-            status.Text = "Target not found!"
-            return
-        end
-        local pets = {}
-        if config.tradeWholeInventory then
-            for _,itm in ipairs(LocalPlayer.Backpack:GetChildren()) do
-                if itm:IsA("Tool") then table.insert(pets, itm.Name) end
-            end
-        else
-            pets = config.selectedPets
-        end
-        for _,petName in ipairs(pets) do
-            sendTrade(petName, target)
-        end
-        status.Text = "Trade complete!"
-    end)
-
-    Notification.OnClientEvent:Connect(function(msg)
-        status.Text = "Status: " .. msg
-    end)
+-- Simple notification
+local function notify(msg)
+	print("[AutoTrade] " .. msg)
 end
 
-----------------------------------------------------------------
---// SERVER SIDE HANDLER
-----------------------------------------------------------------
-if game:GetService("RunService"):IsServer() then
-    Trade_RE.OnServerEvent:Connect(function(player, data)
-        if typeof(data) ~= "table" then return end
-        if data.Action ~= "GivePet" then return end
+--// UI Setup
+local ScreenGui = Instance.new("ScreenGui", game.CoreGui)
+ScreenGui.Name = "GAG_AutoTradeUI"
+local Frame = Instance.new("Frame", ScreenGui)
+Frame.Size = UDim2.fromOffset(340, 380)
+Frame.Position = UDim2.new(0.5, -170, 0.5, -190)
+Frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+Frame.Active, Frame.Draggable = true, true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0,12)
 
-        local target = data.Target
-        local petName = data.PetName
-        if not (player and target and target:IsA("Player")) then return end
-        if player == target then return end
+local Title = Instance.new("TextLabel", Frame)
+Title.Size = UDim2.new(1,0,0,30)
+Title.Text = "Grow a Garden Auto Trade (Simulated)"
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 16
+Title.TextColor3 = Color3.new(1,1,1)
+Title.BackgroundTransparency = 1
 
-        local backpack = player:FindFirstChildOfClass("Backpack")
-        local targetBackpack = target:FindFirstChildOfClass("Backpack")
-        if not (backpack and targetBackpack) then return end
+local Status = Instance.new("TextLabel", Frame)
+Status.Size = UDim2.new(1,-20,0,20)
+Status.Position = UDim2.new(0,10,1,-30)
+Status.BackgroundTransparency = 1
+Status.Font = Enum.Font.Gotham
+Status.TextSize = 14
+Status.TextColor3 = Color3.new(1,1,1)
+Status.Text = "Status: Idle"
 
-        local pet = backpack:FindFirstChild(petName) or (player.Character and player.Character:FindFirstChild(petName))
-        if not pet or not pet:IsA("Tool") then
-            Notification:FireClient(player, "Pet not found: " .. tostring(petName))
-            return
-        end
+local startBtn = Instance.new("TextButton", Frame)
+startBtn.Size = UDim2.new(1,-20,0,36)
+startBtn.Position = UDim2.new(0,10,1,-70)
+startBtn.Text = "Start Simulated Trade"
+startBtn.Font = Enum.Font.GothamBold
+startBtn.TextSize = 16
+startBtn.TextColor3 = Color3.new(1,1,1)
+startBtn.BackgroundColor3 = Color3.fromRGB(70,70,70)
+Instance.new("UICorner", startBtn).CornerRadius = UDim.new(0,8)
 
-        pet.Parent = targetBackpack
-        Notification:FireClient(player, "Traded " .. petName .. " to " .. target.Name)
-        Notification:FireClient(target, "Received " .. petName .. " from " .. player.Name)
-    end)
+--// Core logic (simulated)
+local function simulateTrade(version)
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if not backpack then return end
+	for _, item in ipairs(backpack:GetChildren()) do
+		if item:IsA("Tool") and item:FindFirstChild("Pet Local Script") then
+			if version == 1 then
+				notify("Trade_RE simulated: "..item.Name)
+			elseif version == 2 then
+				notify("GiftPet_RE simulated: "..item.Name)
+			else
+				notify("TradeHandler simulated: "..item.Name)
+			end
+			task.wait(0.4)
+		end
+	end
+	Status.Text = "Status: Finished simulation ("..version..")"
 end
+
+-- buttons to pick version
+for i = 1,3 do
+	local btn = Instance.new("TextButton", Frame)
+	btn.Size = UDim2.new(1,-20,0,32)
+	btn.Position = UDim2.new(0,10,0,40 + (i-1)*36)
+	btn.BackgroundColor3 = Color3.fromRGB(50,50,50)
+	btn.TextColor3 = Color3.new(1,1,1)
+	btn.Font = Enum.Font.Gotham
+	btn.TextSize = 14
+	btn.Text = "Try Version "..i
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
+	btn.MouseButton1Click:Connect(function()
+		Status.Text = "Status: Simulating v"..i
+		simulateTrade(i)
+	end)
+end
+
+startBtn.MouseButton1Click:Connect(function()
+	Status.Text = "Status: Starting all versions..."
+	for v=1,3 do simulateTrade(v) end
+end)
+
+notify("UI ready. Choose version 1–3 to simulate trade behavior.")
